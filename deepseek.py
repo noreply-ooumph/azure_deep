@@ -84,17 +84,6 @@ def load_chat_history(user_email, chat_id):
         return data
     return None
 
-def update_chat_title(user_email, chat_id, messages):
-    """Update chat title when first message arrives"""
-    filename = get_chat_filename(user_email, chat_id)
-    if os.path.exists(filename):
-        with open(filename, 'r') as f:
-            data = json.load(f)
-        data["title"] = generate_chat_title(messages)
-        data["updated_at"] = datetime.now().isoformat()
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
-
 def list_chat_sessions(user_email):
     sessions = []
     safe_email = user_email.replace('@', '_at_').replace('.', '_dot_')
@@ -106,15 +95,12 @@ def list_chat_sessions(user_email):
             try:
                 with open(filepath, 'r') as f:
                     data = json.load(f)
-                # Ensure title exists for all chats
                 title = data.get("title")
                 if not title:
                     title = generate_chat_title(data.get("messages", []))
                     data["title"] = title
-                    # Update file with new title
                     with open(filepath, 'w') as fw:
                         json.dump(data, fw, indent=2, default=str)
-
                 sessions.append({
                     "chat_id": chat_id,
                     "title": title,
@@ -178,15 +164,36 @@ def file_to_content_part(uploaded_file):
         return {"type": "image_url", "image_url": {"url": data_url}}
     return {"type": "text", "text": f"[Attached: {uploaded_file.name} ({mime_type}, {len(file_bytes)} bytes)]"}
 
-# -- Render message
+# -- Extract clean text from message content
+def extract_text_from_content(content):
+    """Extract only the user's text from content, removing any code or file artifacts"""
+    if isinstance(content, str):
+        # Return only clean text, strip any code blocks
+        return content
+    elif isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if part.get("type") == "text":
+                text = part["text"]
+                # Only add if it's actual user text, not file attachment text
+                if not text.startswith("[Attached:"):
+                    text_parts.append(text)
+        return "\n".join(text_parts) if text_parts else ""
+    return ""
+
+# -- Render message - FIXED to only show clean content
 def render_message(msg):
     content = msg["content"]
     if isinstance(content, str):
+        # Display clean text only
         st.markdown(content)
     elif isinstance(content, list):
         for part in content:
             if part.get("type") == "text":
-                st.markdown(part["text"])
+                text = part["text"]
+                # Only display if it's actual user text, not file attachment text
+                if not text.startswith("[Attached:"):
+                    st.markdown(text)
             elif part.get("type") == "image_url":
                 st.image(part["image_url"]["url"])
 
@@ -228,18 +235,20 @@ def show_app():
             "in the world and optimised without wasting any token and best respose in the world "
             "without any error."
         )
+    if "_chat_saved_at" not in st.session_state:
+        st.session_state["_chat_saved_at"] = ""
+    if "_last_user_text" not in st.session_state:
+        st.session_state["_last_user_text"] = ""
 
     # -- Sidebar
     with st.sidebar:
         st.markdown(f"**Signed in as:** `{st.session_state['user_email']}`")
 
-        # Chat management section
         st.divider()
         st.markdown("### 💬 Chat Sessions")
 
         # New chat button
         if st.button("➕ New Chat", use_container_width=True, type="primary"):
-            # Save current chat before starting new one
             if st.session_state.messages and st.session_state.current_chat_id:
                 save_chat_history(
                     st.session_state['user_email'],
@@ -250,12 +259,12 @@ def show_app():
                 )
             st.session_state.messages = []
             st.session_state.current_chat_id = None
+            st.session_state['_chat_saved_at'] = datetime.now().isoformat()
             st.rerun()
 
         # List existing chats
         sessions = list_chat_sessions(st.session_state['user_email'])
 
-        # Highlight current chat in sidebar if it exists
         if st.session_state.current_chat_id:
             for s in sessions:
                 if s['chat_id'] == st.session_state.current_chat_id:
@@ -264,21 +273,16 @@ def show_app():
         if sessions:
             for session in sessions:
                 is_current = session.get('is_current', False)
-
                 col1, col2, col3 = st.columns([3, 1, 1])
                 with col1:
-                    # Use chat title instead of date/time
                     title = session.get("title", "New Chat")
                     msgs = session.get("message_count", 0)
-
-                    # Hidden button for actual click handling
                     button_clicked = st.button(
                         f"💬 {title} ({msgs})", 
-                        key=f"chat_{session['chat_id']}", 
+                        key=f"chat_{session['chat_id']}_{st.session_state['_chat_saved_at']}", 
                         use_container_width=True,
                         help=f"Model: {session.get('model', 'Unknown')} | Messages: {msgs}"
                     )
-
                     if button_clicked:
                         data = load_chat_history(st.session_state['user_email'], session['chat_id'])
                         if data:
@@ -289,7 +293,7 @@ def show_app():
                             st.rerun()
 
                 with col2:
-                    if st.button("🗑️", key=f"del_{session['chat_id']}", help="Delete this chat"):
+                    if st.button("🗑️", key=f"del_{session['chat_id']}_{st.session_state['_chat_saved_at']}", help="Delete this chat"):
                         delete_chat_history(st.session_state['user_email'], session['chat_id'])
                         if st.session_state.current_chat_id == session['chat_id']:
                             st.session_state.messages = []
@@ -325,7 +329,6 @@ def show_app():
 
         # Sign out
         if st.button("🚪 Sign out", use_container_width=True):
-            # Save current chat before signing out
             if st.session_state.messages and st.session_state.current_chat_id:
                 save_chat_history(
                     st.session_state['user_email'],
@@ -335,7 +338,7 @@ def show_app():
                     st.session_state.system_prompt
                 )
             for key in ["authenticated", "user_email", "messages", "current_chat_id", 
-                       "selected_model", "system_prompt"]:
+                       "selected_model", "system_prompt", "_chat_saved_at", "_last_user_text"]:
                 st.session_state.pop(key, None)
             st.rerun()
 
@@ -350,12 +353,25 @@ def show_app():
     else:
         st.caption("New chat session")
 
-    # Display messages
+    # Display messages - FIXED to only show clean user content
     for idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
-            render_message(msg)
-            if msg["role"] == "assistant" and isinstance(msg["content"], str):
-                show_downloads(msg["content"], key_prefix=f"hist_{id(msg)}")
+            content = msg["content"]
+            if msg["role"] == "user":
+                # For user messages, extract and show only clean text
+                clean_text = extract_text_from_content(content)
+                if clean_text:
+                    st.markdown(clean_text)
+                # Also show images if any
+                if isinstance(content, list):
+                    for part in content:
+                        if part.get("type") == "image_url":
+                            st.image(part["image_url"]["url"])
+            else:
+                # For assistant messages, show as normal
+                render_message(msg)
+                if isinstance(content, str):
+                    show_downloads(content, key_prefix=f"hist_{id(msg)}")
 
     # File uploader
     uploaded_files = st.file_uploader(
@@ -366,22 +382,38 @@ def show_app():
         help="Upload images, videos, or documents to include with your message.",
     )
 
-    # Chat input
+    # Chat input - FIXED to only capture user's text
     if prompt := st.chat_input("Ask anything... (attach files above)"):
+        # Store the clean user text for display
+        st.session_state["_last_user_text"] = prompt
+
         content_parts = []
         if uploaded_files:
             for uf in uploaded_files:
                 content_parts.append(file_to_content_part(uf))
+        # Always add user's text as clean text part
         content_parts.append({"type": "text", "text": prompt})
-        user_content = content_parts if len(content_parts) > 1 else prompt
 
-        st.session_state.messages.append({"role": "user", "content": user_content})
+        # Use the structured content for API but store clean display
+        user_content_for_api = content_parts if len(content_parts) > 1 else prompt
+
+        # Store in messages - use the structured format for API, but render only clean text
+        st.session_state.messages.append({"role": "user", "content": user_content_for_api})
+
+        # Display only clean user text immediately
         with st.chat_message("user"):
-            render_message({"role": "user", "content": user_content})
+            st.markdown(prompt)
+            # Also show any uploaded images
+            for uf in uploaded_files:
+                if uf.type and uf.type.startswith("image/"):
+                    st.image(uf)
 
+        # Prepare API messages
         api_messages = [{"role": "system", "content": system_prompt}]
         for msg in st.session_state.messages:
             api_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        st.session_state["_chat_saved_at"] = datetime.now().isoformat()
 
         with st.chat_message("assistant"):
             try:
@@ -400,7 +432,7 @@ def show_app():
             st.session_state.messages.append({"role": "assistant", "content": result})
             show_downloads(result, key_prefix=f"new_{len(st.session_state.messages)}")
 
-            # Auto-save chat after each message (creates new ID if needed)
+            # Auto-save chat after each message
             if not st.session_state.current_chat_id:
                 st.session_state.current_chat_id = hashlib.md5(
                     f"{st.session_state['user_email']}_{datetime.now().isoformat()}".encode()
@@ -415,6 +447,7 @@ def show_app():
                 model,
                 system_prompt
             )
+            st.session_state['_chat_saved_at'] = datetime.now().isoformat()
 
 # -- Router
 if st.session_state.get("authenticated"):
