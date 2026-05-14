@@ -2,6 +2,8 @@ import streamlit as st
 from openai import AzureOpenAI
 import pandas as pd
 import os
+import base64
+import mimetypes
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Ooumph", page_icon="👑", layout="wide")
@@ -18,44 +20,41 @@ def load_allowed_emails(path: str = "allowed_emails.csv") -> set:
 
 # ── Login page ────────────────────────────────────────────────────────────────
 def show_login():
-    # Centered card via columns
     _, col, _ = st.columns([1, 1.4, 1])
     with col:
         st.markdown(
             """
-            <style>
-            /* hide default streamlit header/footer on login */
-            header, footer {visibility: hidden;}
-
-            .login-card {
-                background: linear-gradient(135deg, #0f0f0f 0%, #1a1a2e 100%);
-                border: 1px solid #2a2a4a;
-                border-radius: 16px;
-                padding: 2.5rem 2rem 2rem;
-                box-shadow: 0 8px 40px rgba(0,0,0,0.6);
-                margin-top: 8vh;
-            }
-            .login-title {
-                font-size: 2rem;
-                font-weight: 800;
-                text-align: center;
-                background: linear-gradient(90deg, #a78bfa, #60a5fa);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                margin-bottom: 0.25rem;
-            }
-            .login-sub {
-                text-align: center;
-                color: #6b7280;
-                font-size: 0.85rem;
-                margin-bottom: 1.8rem;
-            }
-            </style>
-            <div class="login-card">
-              <div class="login-title">👑 Ooumph</div>
-              <div class="login-sub">Enter your authorised email to continue</div>
-            </div>
-            """,
+<style>
+header, footer {visibility: hidden;}
+.login-card {
+    background: linear-gradient(135deg, #0f0f0f 0%, #1a1a2e 100%);
+    border: 1px solid #2a2a4a;
+    border-radius: 16px;
+    padding: 2.5rem 2rem 2rem;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+    margin-top: 8vh;
+}
+.login-title {
+    font-size: 2rem;
+    font-weight: 800;
+    text-align: center;
+    background: linear-gradient(90deg, #a78bfa, #60a5fa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.25rem;
+}
+.login-sub {
+    text-align: center;
+    color: #6b7280;
+    font-size: 0.85rem;
+    margin-bottom: 1.8rem;
+}
+</style>
+<div class="login-card">
+  <div class="login-title">👑 Ooumph</div>
+  <div class="login-sub">Enter your authorised email to continue</div>
+</div>
+""",
             unsafe_allow_html=True,
         )
 
@@ -78,12 +77,35 @@ def show_login():
             else:
                 st.error("Access denied. Your email is not on the approved list.")
 
+# ── Helper: encode uploaded file to base64 data URI ──────────────────────────
+def file_to_content_part(uploaded_file):
+    file_bytes = uploaded_file.read()
+    mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0] or "application/octet-stream"
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    data_url = f"data:{mime_type};base64,{b64}"
+    if mime_type.startswith("image/"):
+        return {"type": "image_url", "image_url": {"url": data_url}}
+    else:
+        return {"type": "text", "text": f"[Attached file: {uploaded_file.name} ({mime_type}, {len(file_bytes)} bytes)]"}
+
+# ── Render a stored message ──────────────────────────────────────────────────
+def render_message(msg):
+    content = msg["content"]
+    if isinstance(content, str):
+        st.write(content)
+    elif isinstance(content, list):
+        for part in content:
+            if part.get("type") == "text":
+                st.write(part["text"])
+            elif part.get("type") == "image_url":
+                st.image(part["image_url"]["url"])
+            else:
+                st.write(str(part))
+
 # ── Main chat app ─────────────────────────────────────────────────────────────
 def show_app():
-    # Restore default header visibility
     st.markdown("<style>header, footer {visibility: visible;}</style>", unsafe_allow_html=True)
 
-    # Sidebar
     with st.sidebar:
         st.markdown(f"**Signed in as:** `{st.session_state['user_email']}`")
         if st.button("Sign out", use_container_width=True):
@@ -104,7 +126,6 @@ def show_app():
 
     st.title("deepseek / kimi")
 
-    # Azure client (created once per model selection)
     client = AzureOpenAI(
         azure_endpoint="https://ai-praveenmishraai8491456994967768.openai.azure.com/",
         api_key="Fq04ZUOnjv0YpY39JUp9YZ922aZqTpc7glsIpbBl2Ki11ZIAmb0qJQQJ99CEACYeBjFXJ3w3AAAAACOGQ9Nb",
@@ -114,22 +135,38 @@ def show_app():
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Render history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            st.write(msg["content"])
+            render_message(msg)
 
-    # Input
-    if prompt := st.chat_input("Ask anything..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    uploaded_files = st.file_uploader(
+        "Attach images, videos or files",
+        accept_multiple_files=True,
+        type=["png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "avi", "pdf", "txt", "csv", "py", "json"],
+        label_visibility="collapsed",
+        help="Upload images, videos, or documents to include in your message.",
+    )
+
+    if prompt := st.chat_input("Ask anything... (attach files above)"):
+        content_parts = []
+        if uploaded_files:
+            for uf in uploaded_files:
+                content_parts.append(file_to_content_part(uf))
+        content_parts.append({"type": "text", "text": prompt})
+        user_content = content_parts if len(content_parts) > 1 else prompt
+
+        st.session_state.messages.append({"role": "user", "content": user_content})
         with st.chat_message("user"):
-            st.write(prompt)
+            render_message({"role": "user", "content": user_content})
+
+        api_messages = [{"role": "system", "content": system_prompt}]
+        for msg in st.session_state.messages:
+            api_messages.append({"role": msg["role"], "content": msg["content"]})
 
         with st.chat_message("assistant"):
             response = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "system", "content": system_prompt}]
-                + st.session_state.messages,
+                messages=api_messages,
                 stream=True,
             )
             result = st.write_stream(
@@ -138,7 +175,6 @@ def show_app():
                 if chunk.choices
             )
         st.session_state.messages.append({"role": "assistant", "content": result})
-
 
 # ── Router ────────────────────────────────────────────────────────────────────
 if st.session_state.get("authenticated"):
