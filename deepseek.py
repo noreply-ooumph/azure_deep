@@ -286,26 +286,138 @@ def render_message(msg):
             elif part.get("type") == "image_url":
                 st.image(part["image_url"]["url"])
 
-# -- Download buttons for assistant reply
-def show_downloads(text, key_prefix=""):
+
+# =============================================================================
+# IMPROVED DOWNLOAD FUNCTIONALITY
+# =============================================================================
+def detect_code_blocks(text):
+    """Detect and extract all code blocks with their language and content."""
     pattern = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
     blocks = pattern.findall(text)
+    return blocks
+
+def get_extension_for_language(lang):
+    """Map language identifiers to file extensions."""
     ext_map = {
         "python":"py","py":"py","javascript":"js","js":"js","typescript":"ts","ts":"ts",
         "html":"html","css":"css","json":"json","yaml":"yaml","yml":"yml","bash":"sh","sh":"sh",
         "sql":"sql","csv":"csv","markdown":"md","md":"md","xml":"xml","toml":"toml",
-        "dockerfile":"dockerfile","r":"r","rust":"rs","go":"go","java":"java","cpp":"cpp","c":"c"
+        "dockerfile":"Dockerfile","r":"r","rust":"rs","go":"go","java":"java","cpp":"cpp","c":"c",
+        "text":"txt","txt":"txt","plain":"txt","svg":"svg","ini":"ini","cfg":"cfg",
+        "ps1":"ps1","powershell":"ps1","batch":"bat","bat":"bat",
+        "diff":"diff","patch":"diff","graphql":"graphql","gql":"graphql",
+        "makefile":"Makefile","cmake":"cmake","dockerfile":"Dockerfile",
     }
+    return ext_map.get(lang.lower(), "txt") if lang else "txt"
+
+def show_downloads(text, key_prefix=""):
+    """Enhanced download functionality that offers files in their original format."""
+    blocks = detect_code_blocks(text)
     uid = key_prefix or str(abs(hash(text)))[:8]
-    with st.expander("⬇️ Download", expanded=False):
+
+    with st.expander("⬇️ Download options", expanded=False):
+        # --- Offer code blocks in their original format ---
         if blocks:
+            st.markdown("**📦 Download individual code blocks in their original format:**")
             for idx, (lang, code) in enumerate(blocks, 1):
-                ext = ext_map.get(lang.lower(), "txt") if lang else "txt"
-                fname = f"output_{idx}.{ext}"
-                st.download_button(label=f"📄 {fname}", data=code.encode("utf-8"),
-                    file_name=fname, mime="text/plain", key=f"dl_{uid}_{idx}")
-        st.download_button(label="📝 Full response (.txt)", data=text.encode("utf-8"),
-            file_name="response.txt", mime="text/plain", key=f"dl_full_{uid}")
+                ext = get_extension_for_language(lang)
+                # Determine appropriate MIME type
+                mime_map = {
+                    "py": "text/x-python", "js": "text/javascript", "html": "text/html",
+                    "css": "text/css", "json": "application/json", "csv": "text/csv",
+                    "md": "text/markdown", "xml": "application/xml", "yaml": "text/yaml",
+                    "yml": "text/yaml", "sh": "application/x-sh", "sql": "text/x-sql",
+                    "txt": "text/plain", "svg": "image/svg+xml"
+                }
+                mime = mime_map.get(ext, "text/plain")
+
+                # Create a smart filename suggestion
+                code_lines = code.strip().split('\n')
+                first_line = code_lines[0][:30].strip() if code_lines else f"block_{idx}"
+                # Clean filename
+                filename_base = re.sub(r'[^\w\s-]', '', first_line).strip().replace(' ', '_')[:20]
+                if not filename_base:
+                    filename_base = f"output_{idx}"
+
+                filename = f"{filename_base}.{ext}"
+
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.code(code[:200] + ("..." if len(code) > 200 else ""), language=lang or "text")
+                with col2:
+                    st.download_button(
+                        label=f"📄 Download {ext.upper()}",
+                        data=code.encode("utf-8"),
+                        file_name=filename,
+                        mime=mime,
+                        key=f"dl_code_{uid}_{idx}",
+                        use_container_width=True
+                    )
+                    st.caption(f"Size: {len(code)} chars")
+
+        # --- Offer full response as text ---
+        st.divider()
+        st.markdown("**📝 Full response:**")
+        st.download_button(
+            label="📄 Download as .txt",
+            data=text.encode("utf-8"),
+            file_name="response.txt",
+            mime="text/plain",
+            key=f"dl_full_{uid}",
+            use_container_width=True
+        )
+
+        # --- Smart format detection from user request ---
+        # If the user asked for a specific file format, offer that
+        if "last_user_text" in st.session_state and st.session_state["_last_user_text"]:
+            user_text = st.session_state["_last_user_text"].lower()
+
+            # Detect requested formats
+            format_patterns = {
+                "python": ("py", "text/x-python"),
+                "javascript": ("js", "text/javascript"),
+                "html": ("html", "text/html"),
+                "css": ("css", "text/css"),
+                "json": ("json", "application/json"),
+                "csv": ("csv", "text/csv"),
+                "markdown": ("md", "text/markdown"),
+                "md": ("md", "text/markdown"),
+                "txt": ("txt", "text/plain"),
+                "text": ("txt", "text/plain"),
+                "sql": ("sql", "text/x-sql"),
+                "yaml": ("yaml", "text/yaml"),
+                "yml": ("yml", "text/yaml"),
+                "xml": ("xml", "application/xml"),
+                "svg": ("svg", "image/svg+xml"),
+                "bash": ("sh", "application/x-sh"),
+                "sh": ("sh", "application/x-sh"),
+            }
+
+            offered_formats = set()
+            for fmt_key, (ext, mime) in format_patterns.items():
+                if fmt_key in user_text and ext not in offered_formats:
+                    offered_formats.add(ext)
+
+                    # Extract code block if it matches the requested format, else use full text
+                    code_content = ""
+                    for lang, code in blocks:
+                        if get_extension_for_language(lang) == ext:
+                            code_content = code
+                            break
+
+                    if not code_content:
+                        code_content = text  # Fallback to full text
+
+                    filename_base = f"output.{ext}"
+                    st.download_button(
+                        label=f"📄 Download as .{ext} ({fmt_key})",
+                        data=code_content.encode("utf-8"),
+                        file_name=filename_base,
+                        mime=mime,
+                        key=f"dl_requested_{uid}_{ext}",
+                        use_container_width=True
+                    )
+
 
 # -- Main app
 def show_app():
@@ -489,7 +601,8 @@ def show_app():
             else:
                 render_message(msg)
                 if isinstance(content, str):
-                    show_downloads(content, key_prefix=f"hist_{id(msg)}")
+                    # Use the enhanced download function
+                    show_downloads(content, key_prefix=f"hist_{id(msg)}_{idx}")
 
     # File uploader
     uploaded_files = st.file_uploader(
@@ -558,6 +671,7 @@ def show_app():
 
         if result:
             st.session_state.messages.append({"role": "assistant", "content": result})
+            # Use the enhanced download function for new responses too
             show_downloads(result, key_prefix=f"new_{len(st.session_state.messages)}")
 
             # Auto-save chat after each message
