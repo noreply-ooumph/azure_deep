@@ -1,12 +1,27 @@
 import streamlit as st
-from openai import AzureOpenAI
+from openai import OpenAI
 import pandas as pd
 import os
 import base64
 import mimetypes
+import re
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Ooumph", page_icon="👑", layout="wide")
+
+# ── Azure AI Foundry client factory ──────────────────────────────────────────
+# Azure AI Foundry endpoint pattern:
+#   https://<resource>.services.ai.azure.com/models
+# Use the plain OpenAI client with base_url pointing there.
+AZURE_ENDPOINT = "https://ai-praveenmishraai8491456994967768.services.ai.azure.com/models"
+AZURE_API_KEY  = "Fq04ZUOnjv0YpY39JUp9YZ922aZqTpc7glsIpbBl2Ki11ZIAmb0qJQQJ99CEACYeBjFXJ3w3AAAAACOGQ9Nb"
+
+@st.cache_resource
+def get_client():
+    return OpenAI(
+        base_url=AZURE_ENDPOINT,
+        api_key=AZURE_API_KEY,
+    )
 
 # ── Allowed-email loader ──────────────────────────────────────────────────────
 @st.cache_data
@@ -77,30 +92,74 @@ header, footer {visibility: hidden;}
             else:
                 st.error("Access denied. Your email is not on the approved list.")
 
-# ── Helper: encode uploaded file to base64 data URI ──────────────────────────
+# ── Helper: encode uploaded file ──────────────────────────────────────────────
 def file_to_content_part(uploaded_file):
     file_bytes = uploaded_file.read()
-    mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0] or "application/octet-stream"
+    mime_type = (
+        uploaded_file.type
+        or mimetypes.guess_type(uploaded_file.name)[0]
+        or "application/octet-stream"
+    )
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{b64}"
     if mime_type.startswith("image/"):
         return {"type": "image_url", "image_url": {"url": data_url}}
-    else:
-        return {"type": "text", "text": f"[Attached file: {uploaded_file.name} ({mime_type}, {len(file_bytes)} bytes)]"}
+    return {
+        "type": "text",
+        "text": f"[Attached file: {uploaded_file.name} ({mime_type}, {len(file_bytes)} bytes)]",
+    }
 
-# ── Render a stored message ──────────────────────────────────────────────────
+# ── Helper: render message content ───────────────────────────────────────────
 def render_message(msg):
     content = msg["content"]
     if isinstance(content, str):
-        st.write(content)
+        st.markdown(content)
     elif isinstance(content, list):
         for part in content:
             if part.get("type") == "text":
-                st.write(part["text"])
+                st.markdown(part["text"])
             elif part.get("type") == "image_url":
                 st.image(part["image_url"]["url"])
-            else:
-                st.write(str(part))
+
+# ── Helper: extract downloadable blocks from assistant reply ─────────────────
+def show_downloads(text: str, key_prefix: str = ""):
+    """Scan assistant text for fenced code blocks and offer each as a download."""
+    pattern = re.compile(r'```(\w*)\n(.*?)```', re.DOTALL)
+    blocks = pattern.findall(text)
+    ext_map = {
+        "python": "py", "py": "py",
+        "javascript": "js", "js": "js",
+        "typescript": "ts", "ts": "ts",
+        "html": "html", "css": "css",
+        "json": "json", "yaml": "yaml", "yml": "yml",
+        "bash": "sh", "sh": "sh",
+        "sql": "sql", "csv": "csv",
+        "markdown": "md", "md": "md",
+        "xml": "xml", "toml": "toml",
+        "dockerfile": "dockerfile",
+        "r": "r", "rust": "rs", "go": "go",
+        "java": "java", "cpp": "cpp", "c": "c",
+    }
+    uid = key_prefix or str(abs(hash(text)))[:8]
+    with st.expander("⬇️ Download", expanded=False):
+        if blocks:
+            for idx, (lang, code) in enumerate(blocks, 1):
+                ext = ext_map.get(lang.lower(), "txt") if lang else "txt"
+                fname = f"output_{idx}.{ext}"
+                st.download_button(
+                    label=f"📄 {fname}",
+                    data=code.encode("utf-8"),
+                    file_name=fname,
+                    mime="text/plain",
+                    key=f"dl_{uid}_{idx}",
+                )
+        st.download_button(
+            label="📝 Full response (.txt)",
+            data=text.encode("utf-8"),
+            file_name="response.txt",
+            mime="text/plain",
+            key=f"dl_full_{uid}",
+        )
 
 # ── Main chat app ─────────────────────────────────────────────────────────────
 def show_app():
@@ -114,7 +173,10 @@ def show_app():
             st.rerun()
 
         st.divider()
-        model = st.selectbox("Model", ["DeepSeek-V4-Flash", "DeepSeek-V3.2", "Kimi-K2.6"])
+        model = st.selectbox(
+            "Model",
+            ["DeepSeek-V4-Flash", "DeepSeek-V3-0324", "Kimi-K2-Instruct"],
+        )
         system_prompt = st.text_area(
             "System Prompt",
             value=(
@@ -123,30 +185,36 @@ def show_app():
                 "without any error."
             ),
         )
+        st.divider()
+        if st.button("🗑️ Clear chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
 
     st.title("deepseek / kimi")
 
-    client = AzureOpenAI(
-        azure_endpoint="https://ai-praveenmishraai8491456994967768.openai.azure.com/",
-        api_key="Fq04ZUOnjv0YpY39JUp9YZ922aZqTpc7glsIpbBl2Ki11ZIAmb0qJQQJ99CEACYeBjFXJ3w3AAAAACOGQ9Nb",
-        api_version="2024-12-01-preview",
-    )
+    client = get_client()
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    # Render history (preserves full context)
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             render_message(msg)
+            if msg["role"] == "assistant" and isinstance(msg["content"], str):
+                show_downloads(msg["content"], key_prefix=f"hist_{id(msg)}")
 
+    # File uploader
     uploaded_files = st.file_uploader(
         "Attach images, videos or files",
         accept_multiple_files=True,
-        type=["png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "avi", "pdf", "txt", "csv", "py", "json"],
+        type=["png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "avi",
+              "pdf", "txt", "csv", "py", "json"],
         label_visibility="collapsed",
-        help="Upload images, videos, or documents to include in your message.",
+        help="Upload images, videos, or documents to include with your message.",
     )
 
+    # Chat input
     if prompt := st.chat_input("Ask anything... (attach files above)"):
         content_parts = []
         if uploaded_files:
@@ -159,22 +227,30 @@ def show_app():
         with st.chat_message("user"):
             render_message({"role": "user", "content": user_content})
 
+        # Full history sent to API — no context loss
         api_messages = [{"role": "system", "content": system_prompt}]
         for msg in st.session_state.messages:
             api_messages.append({"role": msg["role"], "content": msg["content"]})
 
         with st.chat_message("assistant"):
-            response = client.chat.completions.create(
-                model=model,
-                messages=api_messages,
-                stream=True,
-            )
-            result = st.write_stream(
-                chunk.choices[0].delta.content or ""
-                for chunk in response
-                if chunk.choices
-            )
-        st.session_state.messages.append({"role": "assistant", "content": result})
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=api_messages,
+                    stream=True,
+                )
+                result = st.write_stream(
+                    chunk.choices[0].delta.content or ""
+                    for chunk in response
+                    if chunk.choices
+                )
+            except Exception as e:
+                st.error(f"API error — check model deployment name. Detail: {e}")
+                result = None
+
+        if result:
+            st.session_state.messages.append({"role": "assistant", "content": result})
+            show_downloads(result, key_prefix=f"new_{len(st.session_state.messages)}")
 
 # ── Router ────────────────────────────────────────────────────────────────────
 if st.session_state.get("authenticated"):
