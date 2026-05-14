@@ -16,9 +16,40 @@ st.set_page_config(page_title="Ooumph", page_icon="👑", layout="wide")
 AZURE_ENDPOINT = "https://ai-praveenmishraai8491456994967768.services.ai.azure.com/models"
 AZURE_API_KEY  = "Fq04ZUOnjv0YpY39JUp9YZ922aZqTpc7glsIpbBl2Ki11ZIAmb0qJQQJ99CEACYeBjFXJ3w3AAAAACOGQ9Nb"
 
+# -- System availability flag
+# Set SYSTEM_CLOSED = True to display a maintenance message while keeping the site up
+SYSTEM_CLOSED = False
+
+
 @st.cache_resource
 def get_client():
-    return OpenAI(base_url=AZURE_ENDPOINT, api_key=AZURE_API_KEY)
+    try:
+        return OpenAI(base_url=AZURE_ENDPOINT, api_key=AZURE_API_KEY)
+    except Exception:
+        return None
+
+
+def is_api_available():
+    """Lightweight probe to check if the Azure AI endpoint is reachable."""
+    if SYSTEM_CLOSED:
+        return False, "The system is currently closed for maintenance."
+    try:
+        client = get_client()
+        if client is None:
+            return False, "Could not initialise the API client. Check your Azure credentials."
+        client.models.list()
+        return True, ""
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "403" in err:
+            return False, "API key is invalid or has expired. Contact the administrator."
+        if "404" in err:
+            return False, "Azure endpoint not found. The service may have been removed."
+        if "429" in err:
+            return False, "Rate limit exceeded. Please wait a moment and try again."
+        if "503" in err or "502" in err or "500" in err:
+            return False, "Azure AI service is temporarily unavailable. Try again shortly."
+        return False, f"AI backend unreachable: {err[:120]}"
 
 # -- Allowed-email loader
 @st.cache_data
@@ -346,6 +377,12 @@ def show_app():
     st.title("deepseek / kimi")
     client = get_client()
 
+    # System status banner - shown when AI backend is unavailable
+    if SYSTEM_CLOSED:
+        st.warning("🔧 **System Maintenance** — The AI service is temporarily closed. The site is up but chat is disabled until service is restored.")
+    elif client is None:
+        st.error("⚠️ **AI service unavailable** — Could not connect to the Azure AI backend. The site is still running; chat will resume when the service is restored.")
+
     # Display current chat indicator with title
     if st.session_state.current_chat_id:
         current_title = generate_chat_title(st.session_state.messages)
@@ -417,15 +454,29 @@ def show_app():
 
         with st.chat_message("assistant"):
             try:
-                response = client.chat.completions.create(
-                    model=model, messages=api_messages, stream=True,
-                )
-                result = st.write_stream(
-                    chunk.choices[0].delta.content or ""
-                    for chunk in response if chunk.choices
-                )
+                if client is None or SYSTEM_CLOSED:
+                    st.warning("⚠️ AI service is unavailable right now. Please try again later.")
+                    result = None
+                else:
+                    response = client.chat.completions.create(
+                        model=model, messages=api_messages, stream=True,
+                    )
+                    result = st.write_stream(
+                        chunk.choices[0].delta.content or ""
+                        for chunk in response if chunk.choices
+                    )
             except Exception as e:
-                st.error(f"API error: {e}")
+                err = str(e)
+                if "401" in err or "403" in err:
+                    st.error("🔑 Authentication failed — the API key may have expired. Contact the administrator.")
+                elif "429" in err:
+                    st.warning("⏳ Rate limit reached. Please wait a moment and try again.")
+                elif "503" in err or "502" in err or "500" in err:
+                    st.warning("🔧 Azure AI service is temporarily down. The site is still running — try again shortly.")
+                elif "404" in err:
+                    st.error("🔌 Azure endpoint not found. The service may have been closed or moved.")
+                else:
+                    st.error(f"⚠️ API error: {err[:200]}")
                 result = None
 
         if result:
