@@ -8,48 +8,106 @@ import re
 import json
 from datetime import datetime
 import hashlib
+import requests
 
 # -- Page config (must be first)
 st.set_page_config(page_title="Ooumph", page_icon="👑", layout="wide")
 
-# -- Azure AI Foundry client
-AZURE_ENDPOINT = "https://ai-praveenmishraai8491456994967768.services.ai.azure.com/models"
-AZURE_API_KEY  = "Fq04ZUOnjv0YpY39JUp9YZ922aZqTpc7glsIpbBl2Ki11ZIAmb0qJQQJ99CEACYeBjFXJ3w3AAAAACOGQ9Nb"
+# -- Azure AI Foundry client configuration
+# Different models may require different endpoint URLs or deployment names
+MODEL_CONFIGS = {
+    "DeepSeek-V4-Flash": {
+        "endpoint": "https://ai-praveenmishraai8491456994967768.services.ai.azure.com/models",
+        "deployment": "DeepSeek-V4-Flash"
+    },
+    "DeepSeek-V3-0324": {
+        "endpoint": "https://ai-praveenmishraai8491456994967768.services.ai.azure.com/models",
+        "deployment": "DeepSeek-V3-0324"
+    },
+    "Kimi-K2-Instruct": {
+        "endpoint": "https://ai-praveenmishraai8491456994967768.services.ai.azure.com/models",
+        "deployment": "Kimi-K2-Instruct"
+    }
+}
+
+AZURE_API_KEY = "Fq04ZUOnjv0YpY39JUp9YZ922aZqTpc7glsIpbBl2Ki11ZIAmb0qJQQJ99CEACYeBjFXJ3w3AAAAACOGQ9Nb"
 
 # -- System availability flag
-# Set SYSTEM_CLOSED = True to display a maintenance message while keeping the site up
 SYSTEM_CLOSED = False
 
-
+# Cache clients per model to avoid re-initialization
 @st.cache_resource
-def get_client():
+def get_client(model_name):
     try:
-        return OpenAI(base_url=AZURE_ENDPOINT, api_key=AZURE_API_KEY)
-    except Exception:
-        return None
+        config = MODEL_CONFIGS.get(model_name)
+        if not config:
+            return None, f"Unknown model: {model_name}"
 
+        # For Azure OpenAI, we need to use the correct endpoint format
+        # The deployment name is passed as the model parameter
+        client = OpenAI(
+            base_url=config["endpoint"],
+            api_key=AZURE_API_KEY,
+            default_headers={
+                "api-key": AZURE_API_KEY
+            }
+        )
+        return client, ""
+    except Exception as e:
+        return None, str(e)
+
+def test_model_connection(model_name):
+    """Test if a specific model is reachable"""
+    client, error = get_client(model_name)
+    if client is None:
+        return False, error
+
+    try:
+        # Try a simple chat completion to test the connection
+        test_response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=5,
+            stream=False
+        )
+        return True, ""
+    except Exception as e:
+        err_str = str(e)
+        if "404" in err_str:
+            return False, f"Model '{model_name}' not found at the endpoint. It may not be deployed or available."
+        elif "401" in err_str or "403" in err_str:
+            return False, "Authentication failed. API key may be invalid or expired."
+        elif "429" in err_str:
+            return False, "Rate limit exceeded for this model."
+        else:
+            return False, f"Connection error for '{model_name}': {err_str[:150]}"
 
 def is_api_available():
     """Lightweight probe to check if the Azure AI endpoint is reachable."""
     if SYSTEM_CLOSED:
         return False, "The system is currently closed for maintenance."
+
+    # Test the base endpoint
     try:
-        client = get_client()
-        if client is None:
-            return False, "Could not initialise the API client. Check your Azure credentials."
-        client.models.list()
-        return True, ""
-    except Exception as e:
-        err = str(e)
-        if "401" in err or "403" in err:
+        response = requests.get(
+            MODEL_CONFIGS["DeepSeek-V4-Flash"]["endpoint"],
+            headers={"api-key": AZURE_API_KEY},
+            timeout=5
+        )
+        if response.status_code == 200:
+            return True, ""
+        elif response.status_code == 401 or response.status_code == 403:
             return False, "API key is invalid or has expired. Contact the administrator."
-        if "404" in err:
+        elif response.status_code == 404:
             return False, "Azure endpoint not found. The service may have been removed."
-        if "429" in err:
-            return False, "Rate limit exceeded. Please wait a moment and try again."
-        if "503" in err or "502" in err or "500" in err:
-            return False, "Azure AI service is temporarily unavailable. Try again shortly."
-        return False, f"AI backend unreachable: {err[:120]}"
+        else:
+            return True, ""  # Still try to use it, might work for specific models
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot connect to Azure AI service. Check your internet connection."
+    except requests.exceptions.Timeout:
+        return True, ""  # Timeout might be transient, still try
+    except Exception as e:
+        return True, ""  # Allow through for now
 
 # -- Allowed-email loader
 @st.cache_data
@@ -270,6 +328,8 @@ def show_app():
         st.session_state["_chat_saved_at"] = ""
     if "_last_user_text" not in st.session_state:
         st.session_state["_last_user_text"] = ""
+    if "_model_status" not in st.session_state:
+        st.session_state["_model_status"] = {}
 
     # -- Sidebar
     with st.sidebar:
@@ -339,13 +399,34 @@ def show_app():
 
         st.divider()
 
-        # Model selection
-        model = st.selectbox("Model", 
-                           ["DeepSeek-V4-Flash", "DeepSeek-V3-0324", "Kimi-K2-Instruct"],
-                           index=["DeepSeek-V4-Flash", "DeepSeek-V3-0324", "Kimi-K2-Instruct"].index(
-                               st.session_state.selected_model
-                           ) if st.session_state.selected_model in ["DeepSeek-V4-Flash", "DeepSeek-V3-0324", "Kimi-K2-Instruct"] else 0)
-        st.session_state.selected_model = model
+        # Model selection with status indicator
+        col_model, col_status = st.columns([3, 1])
+        with col_model:
+            model = st.selectbox("Model", 
+                               ["DeepSeek-V4-Flash", "DeepSeek-V3-0324", "Kimi-K2-Instruct"],
+                               index=["DeepSeek-V4-Flash", "DeepSeek-V3-0324", "Kimi-K2-Instruct"].index(
+                                   st.session_state.selected_model
+                               ) if st.session_state.selected_model in ["DeepSeek-V4-Flash", "DeepSeek-V3-0324", "Kimi-K2-Instruct"] else 0)
+
+        # Check model availability when selected
+        if model != st.session_state.selected_model:
+            # Test the new model connection
+            is_available, msg = test_model_connection(model)
+            st.session_state["_model_status"][model] = {"available": is_available, "message": msg}
+
+            if is_available:
+                st.session_state.selected_model = model
+                st.success(f"✅ {model} is available")
+            else:
+                st.warning(f"⚠️ {model}: {msg}")
+
+        with col_status:
+            # Show status indicator for current model
+            status = st.session_state["_model_status"].get(model, {})
+            if status.get("available"):
+                st.markdown("🟢", help="Model available")
+            else:
+                st.markdown("🔴", help="Model may be unavailable")
 
         # System prompt
         system_prompt = st.text_area("System Prompt", value=st.session_state.system_prompt, height=100)
@@ -369,19 +450,22 @@ def show_app():
                     st.session_state.system_prompt
                 )
             for key in ["authenticated", "user_email", "messages", "current_chat_id", 
-                       "selected_model", "system_prompt", "_chat_saved_at", "_last_user_text"]:
+                       "selected_model", "system_prompt", "_chat_saved_at", "_last_user_text", "_model_status"]:
                 st.session_state.pop(key, None)
             st.rerun()
 
     # -- Main content area
     st.title("deepseek / kimi")
-    client = get_client()
 
-    # System status banner - shown when AI backend is unavailable
+    # Get client for selected model
+    client, client_error = get_client(st.session_state.selected_model)
+
+    # System status banner
     if SYSTEM_CLOSED:
         st.warning("🔧 **System Maintenance** — The AI service is temporarily closed. The site is up but chat is disabled until service is restored.")
+        client = None
     elif client is None:
-        st.error("⚠️ **AI service unavailable** — Could not connect to the Azure AI backend. The site is still running; chat will resume when the service is restored.")
+        st.error(f"⚠️ **AI service unavailable** — Could not connect to the model '{st.session_state.selected_model}'. {client_error}")
 
     # Display current chat indicator with title
     if st.session_state.current_chat_id:
@@ -390,22 +474,19 @@ def show_app():
     else:
         st.caption("New chat session")
 
-    # Display messages - FIXED to only show clean user content
+    # Display messages
     for idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             content = msg["content"]
             if msg["role"] == "user":
-                # For user messages, extract and show only clean text
                 clean_text = extract_text_from_content(content)
                 if clean_text:
                     st.markdown(clean_text)
-                # Also show images if any
                 if isinstance(content, list):
                     for part in content:
                         if part.get("type") == "image_url":
                             st.image(part["image_url"]["url"])
             else:
-                # For assistant messages, show as normal
                 render_message(msg)
                 if isinstance(content, str):
                     show_downloads(content, key_prefix=f"hist_{id(msg)}")
@@ -419,33 +500,25 @@ def show_app():
         help="Upload images, videos, or documents to include with your message.",
     )
 
-    # Chat input - FIXED to only capture user's text
+    # Chat input
     if prompt := st.chat_input("Ask anything... (attach files above)"):
-        # Store the clean user text for display
         st.session_state["_last_user_text"] = prompt
 
         content_parts = []
         if uploaded_files:
             for uf in uploaded_files:
                 content_parts.append(file_to_content_part(uf))
-        # Always add user's text as clean text part
         content_parts.append({"type": "text", "text": prompt})
-
-        # Use the structured content for API but store clean display
         user_content_for_api = content_parts if len(content_parts) > 1 else prompt
 
-        # Store in messages - use the structured format for API, but render only clean text
         st.session_state.messages.append({"role": "user", "content": user_content_for_api})
 
-        # Display only clean user text immediately
         with st.chat_message("user"):
             st.markdown(prompt)
-            # Also show any uploaded images
             for uf in uploaded_files:
                 if uf.type and uf.type.startswith("image/"):
                     st.image(uf)
 
-        # Prepare API messages
         api_messages = [{"role": "system", "content": system_prompt}]
         for msg in st.session_state.messages:
             api_messages.append({"role": msg["role"], "content": msg["content"]})
@@ -459,7 +532,9 @@ def show_app():
                     result = None
                 else:
                     response = client.chat.completions.create(
-                        model=model, messages=api_messages, stream=True,
+                        model=st.session_state.selected_model, 
+                        messages=api_messages, 
+                        stream=True,
                     )
                     result = st.write_stream(
                         chunk.choices[0].delta.content or ""
@@ -467,14 +542,16 @@ def show_app():
                     )
             except Exception as e:
                 err = str(e)
-                if "401" in err or "403" in err:
+                if "404" in err:
+                    st.error(f"🔌 Model '{st.session_state.selected_model}' not found at the Azure endpoint. This model may not be deployed or available.")
+                    # Update model status
+                    st.session_state["_model_status"][st.session_state.selected_model] = {"available": False, "message": "Model not deployed"}
+                elif "401" in err or "403" in err:
                     st.error("🔑 Authentication failed — the API key may have expired. Contact the administrator.")
                 elif "429" in err:
                     st.warning("⏳ Rate limit reached. Please wait a moment and try again.")
                 elif "503" in err or "502" in err or "500" in err:
                     st.warning("🔧 Azure AI service is temporarily down. The site is still running — try again shortly.")
-                elif "404" in err:
-                    st.error("🔌 Azure endpoint not found. The service may have been closed or moved.")
                 else:
                     st.error(f"⚠️ API error: {err[:200]}")
                 result = None
@@ -490,12 +567,11 @@ def show_app():
                 ).hexdigest()
                 st.session_state[f"chat_created_{st.session_state.current_chat_id}"] = datetime.now().isoformat()
 
-            # Save and ensure title is set from first user message
             save_chat_history(
                 st.session_state['user_email'],
                 st.session_state.current_chat_id,
                 st.session_state.messages,
-                model,
+                st.session_state.selected_model,
                 system_prompt
             )
             st.session_state['_chat_saved_at'] = datetime.now().isoformat()
