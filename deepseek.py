@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 import hashlib
 
-# -- Page config
+# -- Page config (must be first)
 st.set_page_config(page_title="Ooumph", page_icon="👑", layout="wide")
 
 # -- Azure AI Foundry client
@@ -34,16 +34,36 @@ CHAT_HISTORY_DIR = "chat_histories"
 os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
 
 def get_chat_filename(user_email, chat_id):
-    """Generate safe filename for chat history"""
     safe_email = user_email.replace('@', '_at_').replace('.', '_dot_')
     return os.path.join(CHAT_HISTORY_DIR, f"{safe_email}_{chat_id}.json")
 
+def generate_chat_title(messages):
+    """Generate chat title from first user message (like Claude)"""
+    for msg in messages:
+        if msg["role"] == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                # Clean and truncate
+                title = content.strip()[:50]
+                if len(content) > 50:
+                    title += "..."
+                return title
+            elif isinstance(content, list):
+                for part in content:
+                    if part.get("type") == "text":
+                        text = part["text"].strip()[:50]
+                        if len(part["text"]) > 50:
+                            text += "..."
+                        return text
+    return "New Chat"
+
 def save_chat_history(user_email, chat_id, messages, model, system_prompt):
-    """Save chat history to JSON file"""
     filename = get_chat_filename(user_email, chat_id)
+    chat_title = generate_chat_title(messages)
     data = {
         "chat_id": chat_id,
         "user_email": user_email,
+        "title": chat_title,
         "model": model,
         "system_prompt": system_prompt,
         "messages": messages,
@@ -54,15 +74,28 @@ def save_chat_history(user_email, chat_id, messages, model, system_prompt):
         json.dump(data, f, indent=2, default=str)
 
 def load_chat_history(user_email, chat_id):
-    """Load chat history from JSON file"""
     filename = get_chat_filename(user_email, chat_id)
     if os.path.exists(filename):
         with open(filename, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+        # Ensure backward compatibility for old chats without title
+        if "title" not in data:
+            data["title"] = generate_chat_title(data.get("messages", []))
+        return data
     return None
 
+def update_chat_title(user_email, chat_id, messages):
+    """Update chat title when first message arrives"""
+    filename = get_chat_filename(user_email, chat_id)
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        data["title"] = generate_chat_title(messages)
+        data["updated_at"] = datetime.now().isoformat()
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+
 def list_chat_sessions(user_email):
-    """List all chat sessions for a user"""
     sessions = []
     safe_email = user_email.replace('@', '_at_').replace('.', '_dot_')
     prefix = f"{safe_email}_"
@@ -73,8 +106,18 @@ def list_chat_sessions(user_email):
             try:
                 with open(filepath, 'r') as f:
                     data = json.load(f)
+                # Ensure title exists for all chats
+                title = data.get("title")
+                if not title:
+                    title = generate_chat_title(data.get("messages", []))
+                    data["title"] = title
+                    # Update file with new title
+                    with open(filepath, 'w') as fw:
+                        json.dump(data, fw, indent=2, default=str)
+
                 sessions.append({
                     "chat_id": chat_id,
+                    "title": title,
                     "model": data.get("model", "Unknown"),
                     "created_at": data.get("created_at", "Unknown"),
                     "updated_at": data.get("updated_at", "Unknown"),
@@ -85,7 +128,6 @@ def list_chat_sessions(user_email):
     return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
 
 def delete_chat_history(user_email, chat_id):
-    """Delete a chat history file"""
     filename = get_chat_filename(user_email, chat_id)
     if os.path.exists(filename):
         os.remove(filename)
@@ -121,6 +163,7 @@ header, footer {visibility: hidden;}
                 st.session_state["authenticated"] = True
                 st.session_state["user_email"] = email.strip().lower()
                 st.session_state["current_chat_id"] = None
+                st.session_state["messages"] = []
                 st.rerun()
             else:
                 st.error("Access denied. Your email is not on the approved list.")
@@ -196,6 +239,15 @@ def show_app():
 
         # New chat button
         if st.button("➕ New Chat", use_container_width=True, type="primary"):
+            # Save current chat before starting new one
+            if st.session_state.messages and st.session_state.current_chat_id:
+                save_chat_history(
+                    st.session_state['user_email'],
+                    st.session_state.current_chat_id,
+                    st.session_state.messages,
+                    st.session_state.selected_model,
+                    st.session_state.system_prompt
+                )
             st.session_state.messages = []
             st.session_state.current_chat_id = None
             st.rerun()
@@ -203,26 +255,31 @@ def show_app():
         # List existing chats
         sessions = list_chat_sessions(st.session_state['user_email'])
 
+        # Highlight current chat in sidebar if it exists
+        if st.session_state.current_chat_id:
+            for s in sessions:
+                if s['chat_id'] == st.session_state.current_chat_id:
+                    s['is_current'] = True
+
         if sessions:
             for session in sessions:
+                is_current = session.get('is_current', False)
+
                 col1, col2, col3 = st.columns([3, 1, 1])
                 with col1:
-                    # Format date for display
-                    created = session.get("created_at", "")
-                    if created and created != "Unknown":
-                        try:
-                            dt = datetime.fromisoformat(created)
-                            display = dt.strftime("%b %d, %H:%M")
-                        except:
-                            display = created[:10]
-                    else:
-                        display = "Unknown"
-
+                    # Use chat title instead of date/time
+                    title = session.get("title", "New Chat")
                     msgs = session.get("message_count", 0)
-                    if st.button(f"📁 {display} ({msgs} msgs)", 
-                               key=f"chat_{session['chat_id']}", 
-                               use_container_width=True,
-                               help=f"Model: {session.get('model', 'Unknown')}"):
+
+                    # Hidden button for actual click handling
+                    button_clicked = st.button(
+                        f"💬 {title} ({msgs})", 
+                        key=f"chat_{session['chat_id']}", 
+                        use_container_width=True,
+                        help=f"Model: {session.get('model', 'Unknown')} | Messages: {msgs}"
+                    )
+
+                    if button_clicked:
                         data = load_chat_history(st.session_state['user_email'], session['chat_id'])
                         if data:
                             st.session_state.messages = data.get("messages", [])
@@ -232,7 +289,6 @@ def show_app():
                             st.rerun()
 
                 with col2:
-                    # Delete button
                     if st.button("🗑️", key=f"del_{session['chat_id']}", help="Delete this chat"):
                         delete_chat_history(st.session_state['user_email'], session['chat_id'])
                         if st.session_state.current_chat_id == session['chat_id']:
@@ -241,9 +297,8 @@ def show_app():
                         st.rerun()
 
                 with col3:
-                    # Show model
-                    model_short = session.get('model', '?')[:4]
-                    st.markdown(f"<small>{model_short}</small>", unsafe_allow_html=True)
+                    model_short = session.get('model', '?')[:6]
+                    st.markdown(f"<small style='color: #6b7280;'>{model_short}</small>", unsafe_allow_html=True)
         else:
             st.info("No saved chats yet")
 
@@ -270,6 +325,15 @@ def show_app():
 
         # Sign out
         if st.button("🚪 Sign out", use_container_width=True):
+            # Save current chat before signing out
+            if st.session_state.messages and st.session_state.current_chat_id:
+                save_chat_history(
+                    st.session_state['user_email'],
+                    st.session_state.current_chat_id,
+                    st.session_state.messages,
+                    st.session_state.selected_model,
+                    st.session_state.system_prompt
+                )
             for key in ["authenticated", "user_email", "messages", "current_chat_id", 
                        "selected_model", "system_prompt"]:
                 st.session_state.pop(key, None)
@@ -279,9 +343,10 @@ def show_app():
     st.title("deepseek / kimi")
     client = get_client()
 
-    # Display current chat indicator
+    # Display current chat indicator with title
     if st.session_state.current_chat_id:
-        st.caption(f"Chat ID: {st.session_state.current_chat_id[:8]}... | Model: {st.session_state.selected_model}")
+        current_title = generate_chat_title(st.session_state.messages)
+        st.caption(f"💬 {current_title} | Model: {st.session_state.selected_model} | Messages: {len(st.session_state.messages)}")
     else:
         st.caption("New chat session")
 
@@ -335,14 +400,14 @@ def show_app():
             st.session_state.messages.append({"role": "assistant", "content": result})
             show_downloads(result, key_prefix=f"new_{len(st.session_state.messages)}")
 
-            # Auto-save chat after each message
+            # Auto-save chat after each message (creates new ID if needed)
             if not st.session_state.current_chat_id:
-                # Generate new chat ID
                 st.session_state.current_chat_id = hashlib.md5(
                     f"{st.session_state['user_email']}_{datetime.now().isoformat()}".encode()
                 ).hexdigest()
                 st.session_state[f"chat_created_{st.session_state.current_chat_id}"] = datetime.now().isoformat()
 
+            # Save and ensure title is set from first user message
             save_chat_history(
                 st.session_state['user_email'],
                 st.session_state.current_chat_id,
